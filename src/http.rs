@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,8 +24,9 @@ use tokio::sync::{Semaphore, broadcast};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
 
+use crate::catalog::{Catalog, valid_product};
 use crate::install_page;
-use crate::model::format_bytes;
+use crate::model::{Platform, format_bytes};
 use crate::service::{DownloadPermit, ServiceError, ShareService};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -61,9 +63,7 @@ pub enum HttpError {
     RangeNotSatisfiable,
 }
 
-/// The origin serves only the public resources needed by the two install flows.
-/// Artifact management, uploads, device installation, and health APIs belong
-/// to the removed long-running `serve` product and are intentionally absent.
+/// The HTTP listener serves install resources. Publishing uses the local filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Resource {
     Manifest(String),
@@ -71,6 +71,7 @@ enum Resource {
     DownloadStatus(String),
     Icon(String),
     InstallPage(String),
+    Latest { product: String, platform: Platform },
     InstallProgressScript,
 }
 
@@ -126,10 +127,17 @@ impl HttpState {
         request: Request<Incoming>,
         peer: SocketAddr,
     ) -> Result<Response<ResponseBody>, Infallible> {
-        // Decided once, up front: whichever path produces the response below
-        // (success or error), a HEAD request must end up with an empty body.
-        let is_head = request.method() == Method::HEAD;
         let route = route(request.method(), request.uri().path());
+        self.handle_route(route, request, peer).await
+    }
+
+    async fn handle_route(
+        &self,
+        route: Route,
+        request: Request<Incoming>,
+        peer: SocketAddr,
+    ) -> Result<Response<ResponseBody>, Infallible> {
+        let is_head = request.method() == Method::HEAD;
         let is_download_status = matches!(&route, Route::Found(Resource::DownloadStatus(_)));
         let mut response = match self.dispatch(route, is_head, request, peer).await {
             Ok(response) => response,
@@ -189,7 +197,7 @@ impl HttpState {
             }
             Route::Found(Resource::InstallProgressScript) => Ok(install_progress_script_response()),
             Route::MethodNotAllowed => Ok(method_not_allowed_response()),
-            Route::NotFound => Ok(json_response(
+            Route::NotFound | Route::Found(Resource::Latest { .. }) => Ok(json_response(
                 StatusCode::NOT_FOUND,
                 serde_json::json!({"error":"not found"}),
             )),
@@ -358,6 +366,73 @@ impl HttpState {
     }
 }
 
+fn catalog_route(method: &Method, path: &str) -> Route {
+    if let Some((product, platform)) = path.trim_matches('/').split_once('/')
+        && valid_product(product)
+        && let Some(platform) = Platform::from_path(platform)
+    {
+        return match *method {
+            Method::GET | Method::HEAD => Route::Found(Resource::Latest {
+                product: product.into(),
+                platform,
+            }),
+            _ => Route::MethodNotAllowed,
+        };
+    }
+    route(method, path)
+}
+
+async fn handle_catalog(
+    catalog: Arc<Catalog>,
+    request: Request<Incoming>,
+    peer: SocketAddr,
+) -> Result<Response<ResponseBody>, Infallible> {
+    let route = catalog_route(request.method(), request.uri().path());
+    let resolved = match &route {
+        Route::Found(Resource::Latest { product, platform }) => {
+            catalog.latest(product, *platform).await
+        }
+        Route::Found(
+            Resource::Manifest(id)
+            | Resource::Download { id, .. }
+            | Resource::DownloadStatus(id)
+            | Resource::Icon(id)
+            | Resource::InstallPage(id),
+        ) => catalog.build(id).await,
+        Route::Found(Resource::InstallProgressScript) => {
+            return Ok(if request.method() == Method::HEAD {
+                empty_body(install_progress_script_response())
+            } else {
+                install_progress_script_response()
+            });
+        }
+        Route::MethodNotAllowed => return Ok(method_not_allowed_response()),
+        Route::NotFound => Err(ServiceError::NotFound("not found".into())),
+    };
+    match resolved {
+        Ok(service) => {
+            let route = match route {
+                Route::Found(Resource::Latest { .. }) => {
+                    Route::Found(Resource::InstallPage(service.artifact().id.clone()))
+                }
+                route => route,
+            };
+            HttpState { service }
+                .handle_route(route, request, peer)
+                .await
+        }
+        Err(error) => {
+            let mut response = error_response(error.into());
+            no_store(&mut response);
+            Ok(if request.method() == Method::HEAD {
+                empty_body(response)
+            } else {
+                response
+            })
+        }
+    }
+}
+
 fn request_authority<B>(request: &Request<B>) -> Option<&str> {
     request
         .headers()
@@ -391,6 +466,36 @@ pub async fn run_listener_with_tls(
     tls: Option<TlsAcceptor>,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), BoxError> {
+    run_listener_with_handler(listener, tls, shutdown, move |request, peer| {
+        let state = state.clone();
+        async move { state.handle(request, peer).await }
+    })
+    .await
+}
+
+pub async fn run_catalog_listener(
+    listener: TcpListener,
+    catalog: Catalog,
+    tls: TlsAcceptor,
+    shutdown: impl Future<Output = ()> + Send,
+) -> Result<(), BoxError> {
+    let catalog = Arc::new(catalog);
+    run_listener_with_handler(listener, Some(tls), shutdown, move |request, peer| {
+        handle_catalog(Arc::clone(&catalog), request, peer)
+    })
+    .await
+}
+
+async fn run_listener_with_handler<F, ResponseFuture>(
+    listener: TcpListener,
+    tls: Option<TlsAcceptor>,
+    shutdown: impl Future<Output = ()> + Send,
+    handle: F,
+) -> Result<(), BoxError>
+where
+    F: Fn(Request<Incoming>, SocketAddr) -> ResponseFuture + Clone + Send + 'static,
+    ResponseFuture: Future<Output = Result<Response<ResponseBody>, Infallible>> + Send + 'static,
+{
     let listen = listener.local_addr()?;
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     // Tells every live connection to finish its current request and close.
@@ -401,10 +506,10 @@ pub async fn run_listener_with_tls(
     tracing::info!(address = %listen, "remote-installer origin listening");
     let accept_connections = accept_loop(
         listener,
-        state,
         tls,
         connections.clone(),
         close_connections.clone(),
+        handle,
     );
     tokio::pin!(accept_connections);
     tokio::pin!(shutdown);
@@ -444,13 +549,17 @@ async fn drain(connections: &Semaphore) {
     }
 }
 
-async fn accept_loop(
+async fn accept_loop<F, ResponseFuture>(
     listener: TcpListener,
-    state: HttpState,
     tls: Option<TlsAcceptor>,
     connections: Arc<Semaphore>,
     close_connections: broadcast::Sender<()>,
-) -> Result<(), BoxError> {
+    handle: F,
+) -> Result<(), BoxError>
+where
+    F: Fn(Request<Incoming>, SocketAddr) -> ResponseFuture + Clone + Send + 'static,
+    ResponseFuture: Future<Output = Result<Response<ResponseBody>, Infallible>> + Send + 'static,
+{
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -478,7 +587,7 @@ async fn accept_loop(
             }
         };
         let _ = stream.set_nodelay(true);
-        let state = state.clone();
+        let handle = handle.clone();
         let tls = tls.clone();
         let mut closing = close_connections.subscribe();
         tokio::spawn(async move {
@@ -489,9 +598,9 @@ async fn accept_loop(
                         result = tokio::time::timeout(HEADER_READ_TIMEOUT, tls.accept(stream)) => result??,
                         _ = closing.recv() => return Ok(()),
                     };
-                    serve_connection(stream, peer, state, closing).await
+                    serve_connection(stream, peer, handle, closing).await
                 } else {
-                    serve_connection(stream, peer, state, closing).await
+                    serve_connection(stream, peer, handle, closing).await
                 }
             }
             .await;
@@ -502,22 +611,22 @@ async fn accept_loop(
     }
 }
 
-async fn serve_connection(
+async fn serve_connection<ResponseFuture>(
     stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     peer: SocketAddr,
-    state: HttpState,
+    handle: impl Fn(Request<Incoming>, SocketAddr) -> ResponseFuture,
     mut closing: broadcast::Receiver<()>,
-) -> Result<(), BoxError> {
+) -> Result<(), BoxError>
+where
+    ResponseFuture: Future<Output = Result<Response<ResponseBody>, Infallible>> + Send + 'static,
+{
     // Use the parent builder to obtain a connection that can drain gracefully.
     let mut connection_builder = ConnectionBuilder::new(TokioExecutor::new()).http1_only();
     connection_builder
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT);
-    let service = service_fn(move |request| {
-        let state = state.clone();
-        async move { state.handle(request, peer).await }
-    });
+    let service = service_fn(move |request| handle(request, peer));
     let connection = connection_builder.serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
     loop {

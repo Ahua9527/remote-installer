@@ -8,12 +8,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use remote_installer::apk::ApkToolchain;
 use remote_installer::artifact_input::{self, PreparationStage, SigningPolicy};
+use remote_installer::catalog::{self, Catalog};
 use remote_installer::exposure::{
     ExposureProvider, ExposureSession, LocalExposure, TailscaleStartupCoordinator,
     provider_binary_available,
 };
 use remote_installer::http::{self, HttpState};
-use remote_installer::model::{Artifact, Availability, PlatformMetadata};
+use remote_installer::model::{Artifact, Availability, Platform, PlatformMetadata};
 use remote_installer::service::{ShareConfig, ShareService};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -28,7 +29,7 @@ const BUILD_PREPARATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 #[command(
     name = "remote-installer",
     version,
-    about = "Standalone iOS and Android app distribution over temporary HTTPS"
+    about = "Standalone iOS and Android app distribution over HTTPS"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,6 +41,10 @@ enum Command {
     /// Share one IPA, signed iOS .app, or signed standalone APK.
     #[command(after_help = SHARE_EXAMPLES)]
     Share(Box<ShareArgs>),
+    /// Serve fixed product and platform install pages over Local HTTPS.
+    Serve(ServeArgs),
+    /// Publish a build to a product's fixed install page.
+    Publish(PublishArgs),
     /// Show whether a background share is still running.
     Status(SessionArgs),
     /// Print the saved stdout and stderr for a background share.
@@ -150,6 +155,42 @@ struct ShareArgs {
 }
 
 #[derive(Debug, Args)]
+struct ServeArgs {
+    /// DNS name or IP address covered by the certificate.
+    #[arg(long)]
+    host: String,
+    /// PEM certificate chain with the server certificate first.
+    #[arg(long)]
+    cert: PathBuf,
+    /// Unencrypted PEM private key.
+    #[arg(long)]
+    key: PathBuf,
+    /// Local HTTPS bind address and port.
+    #[arg(long, default_value = "0.0.0.0:8443")]
+    listen: SocketAddr,
+    /// HTTPS port advertised in links when a reverse proxy uses a different port.
+    #[arg(long, value_parser = parse_https_port)]
+    public_port: Option<u16>,
+    /// Build catalog directory. Defaults to ~/Library/Application Support/remote-installer/catalog.
+    #[arg(long)]
+    store: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct PublishArgs {
+    /// Product slug, e.g. islate.
+    product: String,
+    /// Target platform: ios or android.
+    #[arg(value_parser = parse_platform)]
+    platform: Platform,
+    /// Development/ad-hoc IPA, iphoneos .app, or signed standalone APK.
+    artifact: PathBuf,
+    /// Build catalog directory. Must match the serve command.
+    #[arg(long)]
+    store: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct SessionIdArgs {
     /// Background share ID printed by `share --background`.
     id: String,
@@ -225,6 +266,8 @@ async fn main() -> ExitCode {
         .init();
     let result = match Cli::parse().command {
         Command::Share(args) => run_share(*args).await,
+        Command::Serve(args) => serve_catalog(args).await,
+        Command::Publish(args) => publish_build(args).await,
         Command::Status(args) => background::status(&args.id, args.json),
         Command::Logs(args) => background::logs(&args.id),
         Command::Stop(args) => background::stop(&args.id, args.json).await,
@@ -236,6 +279,66 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn parse_platform(value: &str) -> Result<Platform, &'static str> {
+    Platform::from_path(value).ok_or("expected ios or android")
+}
+
+fn store_path(path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(path) = path {
+        return Ok(path);
+    }
+    let home = std::env::var_os("HOME").ok_or("HOME is not set; pass --store PATH")?;
+    Ok(PathBuf::from(home).join("Library/Application Support/remote-installer/catalog"))
+}
+
+async fn serve_catalog(args: ServeArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let root = store_path(args.store)?;
+    let mut local = LocalExposure::bind(args.listen, &args.host, &args.cert, &args.key).await?;
+    if let Some(port) = args.public_port {
+        local
+            .base_url
+            .set_port(Some(port))
+            .expect("HTTPS URLs accept ports");
+    }
+    println!("Build catalog: {}", root.display());
+    println!(
+        "Install pages: {}/<product>/<platform>",
+        local.base_url.as_str().trim_end_matches('/')
+    );
+    http::run_catalog_listener(
+        local.listener,
+        Catalog::new(root, local.base_url),
+        local.tls,
+        async {
+            let signal = wait_for_termination_signal().await;
+            println!("\n{signal} — stopping...");
+        },
+    )
+    .await
+}
+
+async fn publish_build(args: PublishArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let root = store_path(args.store)?;
+    tokio::task::spawn_blocking(move || {
+        let artifact = catalog::publish(
+            &root,
+            &args.product,
+            args.platform,
+            &args.artifact,
+            SigningPolicy::Required,
+        )?;
+        println!(
+            "Published {} to /{}/{}",
+            artifact.title(),
+            args.product,
+            args.platform.path()
+        );
+        println!("Build: {}", artifact.id);
+        Ok(())
+    })
+    .await?
 }
 
 async fn run_share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

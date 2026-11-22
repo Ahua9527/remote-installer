@@ -1,5 +1,6 @@
 pub mod apk;
 pub mod artifact_input;
+pub mod catalog;
 pub mod exposure;
 pub mod http;
 pub mod install_page;

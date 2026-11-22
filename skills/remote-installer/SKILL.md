@@ -203,6 +203,19 @@ interface address and port. Add `--background --json` to the example for a
 managed share. Share the returned HTTPS install page URL, and keep access
 within the intended network using the bind address and firewall settings.
 
+### Fixed product links
+
+If the user wants a bookmark that always opens the latest build, use the LAN
+catalog. Run one `remote-installer serve --host HOST --cert CHAIN --key KEY`
+with the same trusted certificate and DNS as direct LAN mode. On the server
+Mac, run `remote-installer publish PRODUCT ios /path/to/MyApp.ipa` or
+`remote-installer publish PRODUCT android /path/to/MyApp.apk`. Use the same
+`--store` value if either command uses a custom store. After the first publish,
+return the product and platform path using the HTTPS origin printed by `serve`
+(port 8443 by default). Keep `serve` running to keep the links live.
+Use the same product and platform for each update. See the [fixed-link recipe
+in the README](https://github.com/icodesign/remote-installer#keep-a-fixed-install-link-for-each-product).
+
 Other flags worth knowing: `--provider tailscale-serve` (private to the
 tailnet), `--provider tailscale-funnel` (public through Tailscale), and
 `--provider tailscale` (the compatibility alias for Funnel), `--https-port`
