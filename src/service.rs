@@ -7,7 +7,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 use url::Url;
 
-use crate::artifact_input::{ArtifactInputError, PreparedArtifact};
+use crate::artifact_input::{ArtifactInputError, PreparedArtifact, PreparedArtifactMetadata};
 use crate::ipa::{self, ManifestAssets};
 use crate::model::{Artifact, Availability, Platform, PlatformMetadata};
 
@@ -562,41 +562,44 @@ impl ShareService {
         let workspace_dir = workspace_dir.into();
         tokio::fs::create_dir_all(&workspace_dir).await?;
 
-        let metadata = prepared.metadata().clone();
-        let id = format!("artifact-{}", uuid::Uuid::new_v4());
-        let extension = match &metadata.platform_metadata {
-            PlatformMetadata::Ios(_) => "ipa",
-            PlatformMetadata::Android(_) => "apk",
-        };
-        let package_path = workspace_dir.join(format!("{id}.{extension}"));
+        let artifact = describe_artifact(prepared.metadata());
+        let package_path =
+            workspace_dir.join(format!("{}.{}", artifact.id, artifact.download_extension()));
         tokio::fs::copy(prepared.path(), &package_path).await?;
 
-        let icon_path = match metadata.icon_png.as_ref() {
-            Some(icon) => {
-                let icon_path = workspace_dir.join(format!("{id}.icon.png"));
-                tokio::fs::write(&icon_path, icon).await?;
-                Some(icon_path)
-            }
-            None => {
-                tracing::warn!(
-                    artifact_id = %id,
-                    "artifact has no standalone PNG icon; Assets.car-only icons are not extracted"
-                );
-                None
-            }
-        };
+        if let Some(icon) = &prepared.metadata().icon_png {
+            tokio::fs::write(
+                workspace_dir.join(format!("{}.icon.png", artifact.id)),
+                icon,
+            )
+            .await?;
+        } else {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                "artifact has no standalone PNG icon; Assets.car-only icons are not extracted"
+            );
+        }
 
-        let artifact = Artifact {
-            id,
-            file_name: metadata.file_name,
-            byte_count: metadata.byte_count,
-            sha256: metadata.sha256,
-            display_name: metadata.display_name,
-            platform_metadata: metadata.platform_metadata,
-            has_icon: icon_path.is_some(),
-        };
+        Ok(Self::from_staged_artifact(
+            &workspace_dir,
+            public_base_urls,
+            artifact,
+            config,
+        ))
+    }
 
-        Ok(Self {
+    pub(crate) fn from_staged_artifact(
+        workspace_dir: &Path,
+        public_base_urls: Vec<Url>,
+        artifact: Artifact,
+        config: ShareConfig,
+    ) -> Self {
+        let package_path =
+            workspace_dir.join(format!("{}.{}", artifact.id, artifact.download_extension()));
+        let icon_path = artifact
+            .has_icon
+            .then(|| workspace_dir.join(format!("{}.icon.png", artifact.id)));
+        Self {
             public_base_urls,
             artifact,
             package_path,
@@ -606,7 +609,7 @@ impl ShareService {
                 .map(|ttl| Instant::now().checked_add(ttl).unwrap_or_else(far_future)),
             quota: Arc::new(DownloadQuota::new(config.max_downloads)),
             download_grants: Mutex::new(HashMap::new()),
-        })
+        }
     }
 
     /// The artifact, for read-only presentation.
@@ -1093,6 +1096,18 @@ impl ShareService {
 
     fn local_route_at(&self, public_base_url: &Url, path: &str) -> String {
         format!("{}{}", public_base_url.as_str().trim_end_matches('/'), path)
+    }
+}
+
+pub(crate) fn describe_artifact(metadata: &PreparedArtifactMetadata) -> Artifact {
+    Artifact {
+        id: format!("artifact-{}", uuid::Uuid::new_v4()),
+        file_name: metadata.file_name.clone(),
+        byte_count: metadata.byte_count,
+        sha256: metadata.sha256.clone(),
+        display_name: metadata.display_name.clone(),
+        platform_metadata: metadata.platform_metadata.clone(),
+        has_icon: metadata.icon_png.is_some(),
     }
 }
 

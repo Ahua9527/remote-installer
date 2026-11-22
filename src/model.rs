@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 pub const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Whether the share can still produce an install right now.
@@ -18,13 +20,13 @@ pub enum Availability {
 /// Keeping this as an enum prevents the shared service and page from treating
 /// an Android package name as an iOS bundle identifier, or an Android API
 /// level as an iOS version string. Common file metadata stays on `Artifact`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum PlatformMetadata {
     Ios(IosMetadata),
     Android(AndroidMetadata),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct IosMetadata {
     pub bundle_identifier: String,
     pub bundle_version: String,
@@ -33,7 +35,7 @@ pub struct IosMetadata {
     pub minimum_os_version: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AndroidMetadata {
     /// Absent when `apkanalyzer` was unavailable during preparation.
     pub package_name: Option<String>,
@@ -52,13 +54,30 @@ pub enum Platform {
     Android,
 }
 
+impl Platform {
+    pub fn from_path(value: &str) -> Option<Self> {
+        match value {
+            "ios" => Some(Self::Ios),
+            "android" => Some(Self::Android),
+            _ => None,
+        }
+    }
+
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Ios => "ios",
+            Self::Android => "android",
+        }
+    }
+}
+
 /// Immutable description of the single artifact a share session serves.
 ///
 /// Session-scoped limits — expiry, the download quota, how much of it is
 /// spent — deliberately live on `ShareService` instead of here. Everything in
 /// this struct is fixed the moment the package is inspected, which is what lets
 /// the service hand out `&Artifact` without a lock.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Artifact {
     pub id: String,
     pub file_name: String,

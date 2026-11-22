@@ -29,6 +29,7 @@ Remote Installer validates the build, opens a temporary HTTPS link, and prints a
 - Immediate install feedback and live package transfer progress on the install page
 - Automatic tunnel discovery for Tailscale Serve, Tailscale Funnel, and Cloudflare Quick Tunnel
 - Direct LAN sharing over HTTPS with your own TLS certificate
+- Fixed install pages for the latest iOS and Android build of each product
 - Automatic cleanup when sharing ends
 
 Remote Installer distributes an existing build. It does **not** sign, re-sign, register devices, convert App Bundles or split APKs, or make Simulator and App Store builds installable.
@@ -148,6 +149,28 @@ DNS-01 verifies control of your domain through a public TXT record at `_acme-cha
 - **Certbot**. Use a [DNS plugin for your provider](https://eff-certbot.readthedocs.io/en/stable/using.html#dns-plugins) for unattended renewal. For manual issuance, run `certbot certonly --manual --preferred-challenges dns -d ota.example.com` and add the TXT record when prompted. Certbot normally writes `fullchain.pem` and `privkey.pem` under `/etc/letsencrypt/live/ota.example.com/`. Manual DNS challenges need to be repeated for renewal.
 
 Pass the complete PEM chain and matching unencrypted PEM key explicitly. Only the account running Remote Installer needs read access to the key. For an active share after certificate renewal, restart the share to load the renewed files.
+
+### Keep a fixed install link for each product
+
+Run one LAN HTTPS server on the Mac that stores your builds. Use the same hostname and certificate as in the [LAN recipe](#share-directly-on-your-lan).
+
+```bash
+remote-installer serve --host ota.example.com \
+  --cert /path/to/fullchain.pem --key /path/to/privkey.pem
+```
+
+In another terminal or in the build pipeline running on that Mac, publish a build under a product and platform:
+
+```bash
+remote-installer publish my-product ios /path/to/MyApp.ipa
+remote-installer publish my-product android /path/to/MyApp.apk
+```
+
+Bookmark `https://ota.example.com:8443/my-product/ios` and `https://ota.example.com:8443/my-product/android`. Each page starts working after its first successful publish and always opens that platform's latest build. Reuse the same lowercase product name for every update. Missing or invalid builds leave the previous release available. When a new build replaces an older one, the older build's install and download URLs remain usable for 24 hours. Subsequent publishes reclaim expired builds, so leave space for the builds produced during that window. A server restart preserves the published builds and links. Reload the install page to start a new download attempt if progress tracking was interrupted by a restart.
+
+Both commands use `~/Library/Application Support/remote-installer/catalog` by default. Use the same `--store PATH` and macOS account for both commands if you choose a different location. Run `serve` under a process manager such as a macOS LaunchAgent if it should start on login and stay available after the terminal closes. By default it listens on port 8443. An HTTPS URL without a port requires a listener on 443 with permission to bind it, or a reverse proxy on 443 forwarding to the service. When using a reverse proxy, generated manifest and package URLs must use its public origin, so configure the service with the advertised port using `--public-port 443`.
+
+Fixed links are predictable and anyone who can reach the listener can open them. To restrict them to the LAN, limit the bind address or firewall access and keep the port off internet-facing routes. `share` remains available for temporary links with expiry and download limits.
 
 ### Keep sharing after an agent command exits
 
