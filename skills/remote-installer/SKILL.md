@@ -2,34 +2,30 @@
 name: remote-installer
 description: >-
   Put an iOS or Android build on a real phone or tablet over the air with the
-  `remote-installer` CLI — it validates the build, shares it over HTTPS via a
-  tunnel or directly on the LAN, and prints install URLs plus QR codes to scan.
-  Use this whenever
-  someone wants a build onto a physical device without TestFlight or a cable:
-  "get this on my phone", "send this build to a tester", "share the IPA or APK",
-  "install this on my iPad", "let QA try this build", "make a link for this
-  .app", or any mention of over-the-air / OTA install, itms-services, APK, or ad-hoc
-  distribution. Also use it when someone has just finished an Xcode or Android
-  build and asks how to get it onto a device. Not for Simulator installs
-  (build and run directly instead) and not for App Store or TestFlight
-  submission.
+  `remote-installer` CLI. Share a temporary HTTPS link via a tunnel or directly
+  on the LAN, or publish a build to an existing fixed LAN install link. Use this
+  when someone asks to "get this on my phone", "send this build to a tester",
+  "share the IPA or APK", "update the fixed OTA link", or "publish the latest
+  build to our install page". Also covers OTA install, itms-services, and ad-hoc
+  distribution after an Xcode or Android build. For physical device installs
+  outside the App Store and TestFlight.
 ---
 
 # Sharing a mobile build over the air
 
-`remote-installer share <build>` validates an iOS or Android build and prints an
+If the user specifies an existing fixed install link, use the [LAN catalog
+workflow](#fixed-product-links) to publish the new build to that link. For a
+one-off link, `remote-installer share <build>` validates the build and prints an
 HTTPS install page URL for each ready provider. Foreground shares also print QR
-codes. The CLI supports temporary tunnels and direct LAN HTTPS. iOS uses
-`itms-services://`; Android downloads a signed standalone APK for the system
-installer. Stopping the process kills the links.
+codes. iOS uses `itms-services://`; Android downloads a signed standalone APK
+for the system installer.
 
 The published CLI is currently macOS only. iOS `.app` handling shells out to
-Apple system tools. APK handling uses Android SDK `apkanalyzer` and `apksigner`
-when available, either discovered from the SDK environment or passed
-explicitly. Missing automatically discovered tools produce warnings and skip
-only the checks owned by those tools.
+Apple system tools. APK validation uses Android SDK `apkanalyzer` and
+`apksigner` when available. Missing tools produce warnings and skip only the
+checks owned by those tools.
 
-## The one thing that will trip you up
+## Temporary shares
 
 **Without an expiry or download limit, a foreground `share` runs until
 stopped.** If the install link must remain alive after the current agent command
@@ -119,8 +115,11 @@ on the node. An explicitly requested occupied port reports the conflict instead
 of replacing its route. Do not reset the user's existing configuration to
 force it.
 
-For APKs, ensure Android SDK Command-Line Tools and Build Tools are installed.
-If automatic discovery fails, pass `--apkanalyzer-bin` and `--apksigner-bin`.
+For APKs, configure Java, Android SDK Command-Line Tools, and Android SDK Build
+Tools in the environment running the command. With `share`, pass
+`--apkanalyzer-bin` and `--apksigner-bin` if automatic discovery fails.
+`publish` discovers those tools from `PATH`, the SDK environment, or the
+standard per-user SDK directory.
 
 ## Running it
 
@@ -205,16 +204,30 @@ within the intended network using the bind address and firewall settings.
 
 ### Fixed product links
 
-If the user wants a bookmark that always opens the latest build, use the LAN
-catalog. Run one `remote-installer serve --host HOST --cert CHAIN --key KEY`
-with the same trusted certificate and DNS as direct LAN mode. On the server
-Mac, run `remote-installer publish PRODUCT ios /path/to/MyApp.ipa` or
-`remote-installer publish PRODUCT android /path/to/MyApp.apk`. Use the same
-`--store` value if either command uses a custom store. After the first publish,
-return the product and platform path using the HTTPS origin printed by `serve`
-(port 8443 by default). Keep `serve` running to keep the links live.
-Use the same product and platform for each update. See the [fixed-link recipe
-in the README](https://github.com/icodesign/remote-installer#keep-a-fixed-install-link-for-each-product).
+Reuse the existing LAN catalog when the user provides a fixed install link.
+Check `remote-installer publish --help` on the server Mac to confirm the CLI
+supports publishing. Use the product and platform from the existing URL and
+the same macOS account and catalog directory as `serve`. Pass `--store PATH`
+when that service uses a custom store.
+
+```bash
+remote-installer publish PRODUCT ios /path/to/MyApp.ipa
+remote-installer publish PRODUCT android /path/to/MyApp.apk
+```
+
+After a successful publish, check that the full `/PRODUCT/ios` or
+`/PRODUCT/android` URL returns the install page over HTTPS before sharing it.
+Use the configured hostname and port, including any `--public-port` setting.
+The bare hostname can return 404 because the catalog has no homepage. A product
+path showing `no build has been published` has no build in the catalog serving
+that URL. Check the product, platform, and store before retrying.
+
+For a new catalog, run `remote-installer serve --host HOST --cert CHAIN --key KEY`
+with the same trusted certificate and DNS as direct LAN mode. For long-running
+service, use a process manager such as a macOS LaunchDaemon for startup before
+login. If an external ACME client renews the certificate, reload it by
+restarting `serve` after successful renewal. Keep the fixed links within the
+intended network. See the [fixed-link recipe in the README](https://github.com/icodesign/remote-installer#keep-a-fixed-install-link-for-each-product).
 
 Other flags worth knowing: `--provider tailscale-serve` (private to the
 tailnet), `--provider tailscale-funnel` (public through Tailscale), and
@@ -304,8 +317,8 @@ listener and any tunnel it started.
 
 ## When validation fails
 
-Build validation runs before the share opens. Use the reported error to pick a
-fix:
+The CLI validates the build before opening a share or updating a fixed link.
+Use the reported error to pick a fix:
 
 | Error                                                | Means                          | Fix                                                                     |
 | ---------------------------------------------------- | ------------------------------ | ----------------------------------------------------------------------- |
@@ -318,11 +331,11 @@ fix:
 | Local HTTPS certificate or key error                  | PEM file is unreadable, mismatched, or does not cover the host | Check `--host`, use the full chain and matching key, and check file permissions |
 | `could not bind Local HTTPS`                         | Address or port is unavailable | Use an available port or a local interface address                     |
 | `CLI was not found`                                  | Missing tunnel binary          | `brew install cloudflared`, or pass `--cloudflared-bin`                 |
-| Warning: `apkanalyzer was not found`                 | Metadata and split checks skipped | Install SDK Command-Line Tools or pass `--apkanalyzer-bin`           |
-| Warning: `apksigner was not found`                   | Signature verification skipped | Install SDK Build Tools or pass `--apksigner-bin`                      |
+| Warning: `apkanalyzer was not found`                 | Metadata and split checks skipped | Install SDK Command-Line Tools and configure SDK discovery           |
+| Warning: `apksigner was not found`                   | Signature verification skipped | Install SDK Build Tools and configure SDK discovery                    |
 | `APK split packages are not supported`               | Not a standalone APK           | Build a signed universal/standalone APK                                 |
 
-`--allow-unsigned` exists for IPA input only. APK signatures are verified when
+`share --allow-unsigned` applies only to IPA input. APK signatures are verified when
 `apksigner` is available; without it the CLI emits a prominent warning.
 Reach for the flag only when the user explicitly asks.
 It fixes nothing — it moves a failure caught in one second on the Mac to a
