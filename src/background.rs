@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
-use super::ShareArgs;
+use super::{ShareArgs, ShareProvider, print_install_qr};
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -111,7 +111,6 @@ pub(super) async fn start(mut args: ShareArgs) -> Result<(), DynError> {
 
     make_paths_absolute(&mut args)?;
     args.background = false;
-    args.no_qr = true;
     let id = Uuid::new_v4().to_string();
     let label = format!(
         "io.icodesign.remote-installer.share.{}",
@@ -159,6 +158,11 @@ pub(super) async fn start(mut args: ShareArgs) -> Result<(), DynError> {
     match ready {
         Ok(state) => {
             print_state(&state, true, args.json)?;
+            if matches!(args.provider, ShareProvider::Local) && !args.json && !args.no_qr {
+                for link in &state.links {
+                    print_install_qr(&link.install_page, &link.tunnel);
+                }
+            }
             Ok(())
         }
         Err(error) => {
@@ -308,8 +312,6 @@ fn worker_arguments(args: &ShareArgs, executable: String) -> Vec<String> {
             .to_string(),
         "--provider".to_owned(),
         args.provider.cli_name().to_owned(),
-        "--listen".to_owned(),
-        args.listen.to_string(),
         "--no-qr".to_owned(),
         "--managed-session".to_owned(),
         args.managed_session
@@ -318,6 +320,14 @@ fn worker_arguments(args: &ShareArgs, executable: String) -> Vec<String> {
             .display()
             .to_string(),
     ];
+    if let Some(address) = args.listen {
+        result.extend(["--listen".to_owned(), address.to_string()]);
+    }
+    if let Some(host) = &args.host {
+        result.extend(["--host".to_owned(), host.clone()]);
+    }
+    push_path_option(&mut result, "--cert", args.cert.as_deref());
+    push_path_option(&mut result, "--key", args.key.as_deref());
     if let Some(port) = args.https_port {
         result.extend(["--https-port".to_owned(), port.to_string()]);
     }
@@ -366,6 +376,11 @@ fn make_paths_absolute(args: &mut ShareArgs) -> Result<(), DynError> {
             ),
         )
     })?;
+    // Keep certificate paths intact (Certbot's live paths are symlinks).
+    let directory = std::env::current_dir()?;
+    for path in [&mut args.cert, &mut args.key].into_iter().flatten() {
+        *path = directory.join(&*path);
+    }
     for value in [
         &mut args.tailscale_bin,
         &mut args.cloudflared_bin,
@@ -396,7 +411,7 @@ async fn wait_until_ready(
                     .local_address
                     .as_deref()
                     .and_then(|value| value.parse::<SocketAddr>().ok())
-                    && TcpStream::connect(address).await.is_ok()
+                    && TcpStream::connect(probe_address(address)).await.is_ok()
                 {
                     return Ok(state);
                 }
@@ -431,6 +446,15 @@ async fn wait_until_ready(
         }
         sleep(STARTUP_POLL_INTERVAL).await;
     }
+}
+
+fn probe_address(mut address: SocketAddr) -> SocketAddr {
+    match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => address.set_ip(Ipv4Addr::LOCALHOST.into()),
+        IpAddr::V6(ip) if ip.is_unspecified() => address.set_ip(Ipv6Addr::LOCALHOST.into()),
+        _ => {}
+    }
+    address
 }
 
 fn forward_new_stderr(directory: &Path, offset: &mut usize) -> Result<(), DynError> {
@@ -471,7 +495,12 @@ fn print_state(state: &SessionState, running: bool, json: bool) -> Result<(), Dy
         println!("App: {app}");
     }
     for link in &state.links {
-        println!("\nTunnel: {}", link.tunnel);
+        let label = if link.tunnel == remote_installer::exposure::ExposureProvider::Local.name() {
+            "Provider"
+        } else {
+            "Tunnel"
+        };
+        println!("\n{label}: {}", link.tunnel);
         println!("Access: {}", link.access);
         println!("Install page: {}", link.install_page);
     }

@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -9,7 +9,8 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use remote_installer::apk::ApkToolchain;
 use remote_installer::artifact_input::{self, PreparationStage, SigningPolicy};
 use remote_installer::exposure::{
-    ExposureProvider, ExposureSession, TailscaleStartupCoordinator, provider_binary_available,
+    ExposureProvider, ExposureSession, LocalExposure, TailscaleStartupCoordinator,
+    provider_binary_available,
 };
 use remote_installer::http::{self, HttpState};
 use remote_installer::model::{Artifact, Availability, PlatformMetadata};
@@ -19,6 +20,7 @@ use url::Url;
 
 mod background;
 
+const LOCAL_HTTPS_PORT: u16 = 8443;
 const TUNNEL_STARTUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const BUILD_PREPARATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -26,7 +28,7 @@ const BUILD_PREPARATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 #[command(
     name = "remote-installer",
     version,
-    about = "Standalone iOS and Android app distribution over a temporary HTTPS tunnel"
+    about = "Standalone iOS and Android app distribution over temporary HTTPS"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,7 +44,7 @@ enum Command {
     Status(SessionArgs),
     /// Print the saved stdout and stderr for a background share.
     Logs(SessionIdArgs),
-    /// Stop a background share and close its tunnels.
+    /// Stop a background share.
     Stop(SessionArgs),
 }
 
@@ -62,6 +64,9 @@ Examples:
 
   # Share a public link through Tailscale Funnel
   remote-installer share MyApp.ipa --provider tailscale-funnel
+
+  # Share directly on the LAN using a certificate for the advertised host
+  remote-installer share MyApp.ipa --provider local --host ota.example.com --cert fullchain.pem --key privkey.pem
 
   # Share a signed standalone Android APK
   remote-installer share MyApp.apk
@@ -88,8 +93,8 @@ struct ShareArgs {
     /// Stop sharing after this many successful OTA downloads.
     #[arg(long, value_name = "COUNT")]
     max_downloads: Option<u64>,
-    /// Tunnel provider (`tailscale` is an alias for `tailscale-funnel`).
-    /// Omit this option to detect and start every installed provider.
+    /// Sharing provider (`tailscale` is an alias for `tailscale-funnel`).
+    /// Omit this option to detect and start installed tunnel providers.
     #[arg(long, value_enum, default_value_t = ShareProvider::Auto)]
     provider: ShareProvider,
     /// Do not print the install link as a terminal QR code.
@@ -99,9 +104,8 @@ struct ShareArgs {
     /// not control APK checks.
     #[arg(long)]
     allow_unsigned: bool,
-    /// Exact HTTPS port used by Tailscale Serve or an explicitly selected
-    /// Funnel. When omitted, an available port is selected automatically;
-    /// `--funnel-port` remains a visible compatibility alias.
+    /// HTTPS port for Local, Tailscale Serve, or Tailscale Funnel. Local
+    /// defaults to 8443. Tailscale selects an available port when omitted.
     #[arg(
         long = "https-port",
         visible_alias = "funnel-port",
@@ -109,6 +113,15 @@ struct ShareArgs {
         value_parser = parse_https_port
     )]
     https_port: Option<u16>,
+    /// DNS name or IP address covered by the TLS certificate (Local only).
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+    /// PEM certificate chain, with the server certificate first (Local only).
+    #[arg(long, value_name = "PATH")]
+    cert: Option<PathBuf>,
+    /// Unencrypted PEM private key (Local only).
+    #[arg(long, value_name = "PATH")]
+    key: Option<PathBuf>,
     /// Explicit path to the Tailscale CLI.
     #[arg(long, value_name = "PATH")]
     tailscale_bin: Option<PathBuf>,
@@ -121,9 +134,10 @@ struct ShareArgs {
     /// Explicit path to the Android SDK apksigner tool.
     #[arg(long, value_name = "PATH")]
     apksigner_bin: Option<PathBuf>,
-    /// Loopback address for the temporary origin server.
-    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:0")]
-    listen: SocketAddr,
+    /// Bind address and port. Tunnel origins default to 127.0.0.1:0.
+    /// Local defaults to 0.0.0.0:8443. Use --https-port to set just the port.
+    #[arg(long, value_name = "ADDR")]
+    listen: Option<SocketAddr>,
     /// Run as a launchd-managed macOS background share.
     #[arg(long)]
     background: bool,
@@ -171,6 +185,8 @@ enum ShareProvider {
     #[value(name = "tailscale-funnel", alias = "tailscale")]
     TailscaleFunnel,
     Cloudflare,
+    #[value(alias = "lan")]
+    Local,
 }
 
 impl ShareProvider {
@@ -180,6 +196,7 @@ impl ShareProvider {
             Self::TailscaleServe => "tailscale-serve",
             Self::TailscaleFunnel => "tailscale-funnel",
             Self::Cloudflare => "cloudflare",
+            Self::Local => "local",
         }
     }
 }
@@ -193,6 +210,7 @@ impl From<ShareProvider> for ExposureProvider {
             ShareProvider::TailscaleServe => Self::TailscaleServe,
             ShareProvider::TailscaleFunnel => Self::TailscaleFunnel,
             ShareProvider::Cloudflare => Self::Cloudflare,
+            ShareProvider::Local => Self::Local,
         }
     }
 }
@@ -256,11 +274,39 @@ fn report(error: &(dyn std::error::Error + 'static)) {
 }
 
 async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !args.listen.ip().is_loopback() {
-        return Err("--listen must be a loopback address when using share".into());
-    }
+    let is_local = matches!(args.provider, ShareProvider::Local);
+    let local_config = if is_local {
+        let (Some(host), Some(cert), Some(key)) = (&args.host, &args.cert, &args.key) else {
+            return Err("--provider local requires --host, --cert (PEM full chain), and --key (PEM private key)".into());
+        };
+        if args.listen.is_some() && args.https_port.is_some() {
+            return Err(
+                "--provider local accepts either --listen or --https-port for the port".into(),
+            );
+        }
+        Some((host.as_str(), cert.as_path(), key.as_path()))
+    } else {
+        if args.host.is_some() || args.cert.is_some() || args.key.is_some() {
+            return Err("--host, --cert, and --key require --provider local".into());
+        }
+        if args
+            .listen
+            .is_some_and(|address| !address.ip().is_loopback())
+        {
+            return Err("--listen must be a loopback address for tunnel providers".into());
+        }
+        None
+    };
     match args.provider {
         ShareProvider::Auto => {}
+        ShareProvider::Local => {
+            if args.tailscale_bin.is_some() || args.cloudflared_bin.is_some() {
+                return Err(
+                    "--tailscale-bin and --cloudflared-bin cannot be used with --provider local"
+                        .into(),
+                );
+            }
+        }
         ShareProvider::TailscaleServe | ShareProvider::TailscaleFunnel => {
             if args.cloudflared_bin.is_some() {
                 return Err("--cloudflared-bin requires --provider cloudflare".into());
@@ -306,8 +352,7 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
     } else {
         SigningPolicy::Required
     };
-    // Validation runs before the tunnel opens, so a build that cannot install
-    // fails without ever having been exposed publicly.
+    // Validate the build before opening the share to clients.
     let preparation_started_at = std::time::Instant::now();
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut preparation = tokio::task::spawn_blocking(move || {
@@ -354,25 +399,51 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
     for warning in prepared.warnings() {
         eprintln!("Warning: {warning}");
     }
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    let local_address = listener.local_addr()?;
-    let origin_url = Url::parse(&format!("http://{local_address}"))?;
     let validation_summary = if validation_was_degraded {
         "Basic build checks passed"
     } else {
         "Build validated"
     };
-    eprintln!("{validation_summary}. Starting supported tunnel providers...");
-    let mut exposures = start_exposures(&args, &origin_url).await?;
-    for exposure in &exposures {
-        for warning in exposure.warnings() {
-            eprintln!("Warning: {}: {warning}", exposure.provider().name());
+    let (listener, local_url, tls, mut exposures) = if let Some((host, cert, key)) = local_config {
+        let address = args.listen.unwrap_or_else(|| {
+            SocketAddr::from((
+                Ipv4Addr::UNSPECIFIED,
+                args.https_port.unwrap_or(LOCAL_HTTPS_PORT),
+            ))
+        });
+        eprintln!("{validation_summary}. Configuring Local HTTPS...");
+        let local = LocalExposure::bind(address, host, cert, key).await?;
+        (
+            local.listener,
+            Some(local.base_url),
+            Some(local.tls),
+            Vec::new(),
+        )
+    } else {
+        let address = args
+            .listen
+            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let origin_url = Url::parse(&format!("http://{}", listener.local_addr()?))?;
+        eprintln!("{validation_summary}. Starting supported tunnel providers...");
+        let exposures = start_exposures(&args, &origin_url).await?;
+        for exposure in &exposures {
+            for warning in exposure.warnings() {
+                eprintln!("Warning: {}: {warning}", exposure.provider().name());
+            }
         }
-    }
-    eprintln!("Tunnel startup complete. Preparing install page...");
-    let public_base_urls = exposures
+        eprintln!("Tunnel startup complete. Preparing install page...");
+        (listener, None, None, exposures)
+    };
+    let local_address = listener.local_addr()?;
+    let provider_urls = exposures
         .iter()
-        .map(|exposure| exposure.public_base_url().clone())
+        .map(|exposure| (exposure.provider(), exposure.public_base_url()))
+        .chain(local_url.as_ref().map(|url| (ExposureProvider::Local, url)))
+        .collect::<Vec<_>>();
+    let public_base_urls = provider_urls
+        .iter()
+        .map(|(_, url)| (*url).clone())
         .collect();
     let setup_result = ShareService::create_with_public_base_urls(
         temporary.path().join("artifacts"),
@@ -392,7 +463,7 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
         }
     };
     let artifact = service.artifact().clone();
-    let links = match provider_links(&service, &artifact, &exposures).await {
+    let links = match provider_links(&service, &artifact, &provider_urls).await {
         Ok(links) => links,
         Err(error) => {
             stop_exposures(&mut exposures).await;
@@ -426,7 +497,7 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
         service: Arc::clone(&service),
     };
     let origin_result = tokio::select! {
-        result = http::run_listener(listener, state, wait_for_shutdown(Arc::clone(&service))) => result,
+        result = http::run_listener_with_tls(listener, state, tls, wait_for_shutdown(Arc::clone(&service), is_local)) => result,
         result = wait_for_any_exposure_exit(&mut exposures) => result,
     };
     let cleanup_errors = stop_exposures(&mut exposures).await;
@@ -551,6 +622,7 @@ async fn start_exposures(
             provider: ExposureProvider::Cloudflare,
             https_port: args.https_port.unwrap_or(443),
         }),
+        ShareProvider::Local => unreachable!("Local HTTPS does not start a tunnel"),
     }
     if plans.is_empty() {
         return Err("no supported tunnel provider is available".into());
@@ -666,19 +738,19 @@ fn provider_order(provider: ExposureProvider) -> u8 {
         ExposureProvider::TailscaleServe => 0,
         ExposureProvider::TailscaleFunnel | ExposureProvider::Tailscale => 1,
         ExposureProvider::Cloudflare => 2,
+        ExposureProvider::Local => 3,
     }
 }
 
 async fn provider_links(
     service: &ShareService,
     artifact: &Artifact,
-    exposures: &[ExposureSession],
+    provider_urls: &[(ExposureProvider, &Url)],
 ) -> Result<Vec<ProviderLink>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut links = Vec::with_capacity(exposures.len());
-    for exposure in exposures {
-        let public_base_url = exposure.public_base_url();
+    let mut links = Vec::with_capacity(provider_urls.len());
+    for &(provider, public_base_url) in provider_urls {
         links.push(ProviderLink {
-            provider: exposure.provider(),
+            provider,
             install_page_url: service.install_page_url_at(artifact, public_base_url),
             install_action_url: service
                 .install_action_url_at(artifact, public_base_url)
@@ -704,7 +776,7 @@ async fn wait_for_any_exposure_exit(
     match result {
         Some((_index, Ok(()))) => Ok(()),
         Some((index, Err(error))) => Err(format!("{} exited: {error}", names[index]).into()),
-        None => Ok(()),
+        None => std::future::pending().await,
     }
 }
 
@@ -739,7 +811,7 @@ fn preparation_stage_label(stage: PreparationStage) -> &'static str {
 /// a further Ctrl-C exits immediately instead. Without that escape the only
 /// way out of a slow drain is SIGKILL, because tokio keeps consuming SIGINT
 /// once its handler is installed.
-async fn wait_for_shutdown(service: Arc<ShareService>) {
+async fn wait_for_shutdown(service: Arc<ShareService>, is_local: bool) {
     let automatic_shutdown = async {
         let reason = service.wait_until_unavailable().await;
         if reason == Availability::LimitReached {
@@ -759,7 +831,8 @@ async fn wait_for_shutdown(service: Arc<ShareService>) {
                 Availability::LimitReached => "Download limit reached",
                 Availability::Installable => "Share ended",
             };
-            println!("\n{cause} — closing the tunnel.");
+            let target = if is_local { "Local HTTPS listener" } else { "tunnel" };
+            println!("\n{cause} — closing the {target}.");
         }
     }
     tokio::spawn(async {
@@ -807,24 +880,24 @@ fn print_share_banners(artifact: &Artifact, links: &[ProviderLink], args: &Share
         println!("Download limit: {maximum}");
     }
     for link in links {
-        println!("\nTunnel: {}", link.provider.name());
+        let label = if link.provider == ExposureProvider::Local {
+            "Provider"
+        } else {
+            "Tunnel"
+        };
+        println!("\n{label}: {}", link.provider.name());
         println!("Access: {}", access_scope(link.provider));
         println!("Install page: {}", link.install_page_url);
         println!("Install link: {}", link.install_action_url);
         if !args.no_qr {
-            match qr_code(&link.install_page_url) {
-                Some(code) => println!(
-                    "\nScan with the phone camera ({}):\n\n{code}",
-                    link.provider.name()
-                ),
-                None => tracing::debug!(
-                    provider = link.provider.name(),
-                    "install URL could not be encoded as a QR code"
-                ),
-            }
+            print_install_qr(&link.install_page_url, link.provider.name());
         }
     }
-    println!("Press Ctrl-C to stop sharing and close the tunnel.");
+    if matches!(args.provider, ShareProvider::Local) {
+        println!("Press Ctrl-C to stop sharing.");
+    } else {
+        println!("Press Ctrl-C to stop sharing and close the tunnel.");
+    }
 }
 
 fn access_scope(provider: ExposureProvider) -> &'static str {
@@ -835,6 +908,16 @@ fn access_scope(provider: ExposureProvider) -> &'static str {
         ExposureProvider::TailscaleFunnel
         | ExposureProvider::Tailscale
         | ExposureProvider::Cloudflare => "Public internet",
+        ExposureProvider::Local => {
+            "Direct network access (requires reachability and matching DNS or IP)"
+        }
+    }
+}
+
+fn print_install_qr(url: &str, provider: &str) {
+    match qr_code(url) {
+        Some(code) => println!("\nScan with the phone camera ({provider}):\n\n{code}"),
+        None => tracing::debug!(provider, "install URL could not be encoded as a QR code"),
     }
 }
 

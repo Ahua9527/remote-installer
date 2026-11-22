@@ -2,7 +2,7 @@
 
 # Remote Installer
 
-**Install signed iOS and Android builds on real devices over the internet**
+**Install signed iOS and Android builds on real devices over the internet or a local network**
 
 Perfect for AI Agents and vibe coding remotely.
 
@@ -27,7 +27,8 @@ Remote Installer validates the build, opens a temporary HTTPS link, and prints a
 - Support for `.ipa`, signed device `.app`, and signed standalone `.apk` builds
 - Optional expiry and successful-download limits that continue to work across interrupted and resumed range requests
 - Immediate install feedback and live package transfer progress on the install page
-- Automatic provider discovery: starts every installed provider (Tailscale Serve, Tailscale Funnel, and Cloudflare Quick Tunnel)
+- Automatic tunnel discovery for Tailscale Serve, Tailscale Funnel, and Cloudflare Quick Tunnel
+- Direct LAN sharing over HTTPS with your own TLS certificate
 - Automatic cleanup when sharing ends
 
 Remote Installer distributes an existing build. It does **not** sign, re-sign, register devices, convert App Bundles or split APKs, or make Simulator and App Store builds installable.
@@ -43,8 +44,9 @@ It currently supports the following providers:
 - [Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)
 - [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
 - [Tailscale Funnel](https://tailscale.com/docs/features/tailscale-funnel)
+- [Local HTTPS](#share-directly-on-your-lan) with your own certificate and LAN DNS
 
-See each provider's documentation for installation and setup instructions.
+See each provider's documentation for setup instructions.
 
 **Which provider should I choose?**
 
@@ -120,12 +122,37 @@ Or you can simply ask your agent to do everything for you:
 remote-installer share MyApp.ipa --max-downloads 1 --expire-after 1h
 ```
 
-The command exits when either limit is reached, after allowing an active download to finish. After the successful-download limit is reached, it keeps transfer status available for five seconds before closing the tunnel. New download attempts are already blocked during that interval. If the share closes while the page is open, the page directs you to check your device instead of assuming installation failed.
+The command exits when either limit is reached, after allowing an active download to finish. After the successful-download limit is reached, it keeps transfer status available for five seconds before closing the share. New download attempts are already blocked during that interval. If the share closes while the page is open, the page directs you to check your device instead of assuming installation failed.
+
+### Share directly on your LAN
+
+Use a hostname under a domain you control, such as `ota.example.com`, with a TLS certificate trusted by the phone. Set an internal DNS record (for example, on your router or LAN DNS server) so the phone resolves `ota.example.com` to the sharing Mac's LAN IP, such as `192.168.1.20`. Put both devices on a network that allows them to reach each other and allow inbound TCP on the sharing port in the Mac's firewall.
+
+If your domain uses Cloudflare DNS, you can also publish a **DNS only** (gray cloud) A record pointing to the Mac's private IPv4 address. If the phone's resolver blocks public names that return private IPs (DNS rebinding protection), use a local DNS record instead.
+
+```bash
+remote-installer share MyApp.ipa --provider local \
+  --host ota.example.com --cert /path/to/fullchain.pem --key /path/to/privkey.pem \
+  --expire-after 30m --max-downloads 3
+```
+
+Scan the QR code or open the printed `https://ota.example.com:8443/install/…` URL in Safari. The install page, manifest, and package are served directly from the Mac. A current, publicly trusted certificate with a matching hostname and full chain works with iOS's built-in trust store. A URL using an IP address requires a certificate whose Subject Alternative Name contains that exact IP address. Let's Encrypt cannot issue for private LAN IPs, so use the certified hostname for those networks. The usual iOS build signing and provisioning requirements still apply.
+
+Local HTTPS listens on `0.0.0.0:8443` by default. Use `--https-port PORT` to change the port, or `--listen 192.168.1.20:8443` to bind to a specific interface and port. Binding to `0.0.0.0` accepts connections on every IPv4 interface the firewall allows. Keep the port off public interfaces and avoid forwarding it from your router if you want the link confined to your LAN. The `local` provider requires explicit selection. On macOS it also works with `--background --expire-after 30m --json`.
+
+#### Obtain a certificate with DNS-01
+
+DNS-01 verifies control of your domain through a public TXT record at `_acme-challenge.ota.example.com`. The sharing Mac can stay behind your firewall with no public inbound port. The LAN DNS record for the phone is a separate setting.
+
+- **acme.sh**. Configure your [DNS API provider](https://github.com/acmesh-official/acme.sh/wiki/dnsapi), then issue with `acme.sh --issue --server letsencrypt --dns dns_cf -d ota.example.com --keylength ec-256` (Cloudflare DNS example). Deploy the files to a private directory you control with `acme.sh --install-cert -d ota.example.com --ecc --fullchain-file /path/to/fullchain.pem --key-file /path/to/privkey.pem`.
+- **Certbot**. Use a [DNS plugin for your provider](https://eff-certbot.readthedocs.io/en/stable/using.html#dns-plugins) for unattended renewal. For manual issuance, run `certbot certonly --manual --preferred-challenges dns -d ota.example.com` and add the TXT record when prompted. Certbot normally writes `fullchain.pem` and `privkey.pem` under `/etc/letsencrypt/live/ota.example.com/`. Manual DNS challenges need to be repeated for renewal.
+
+Pass the complete PEM chain and matching unencrypted PEM key explicitly. Only the account running Remote Installer needs read access to the key. For an active share after certificate renewal, restart the share to load the renewed files.
 
 ### Keep sharing after an agent command exits
 
 On macOS, `--background` registers the native worker with `launchd`, waits for
-the origin and tunnel to become ready, and then returns the install URL. This
+the share to become ready, and then returns the install URL. This
 keeps the share alive when an AI agent finishes its command or turn. A bounded
 expiry is required:
 
@@ -158,14 +185,16 @@ same lifecycle ownership.
 | `--background`                | Keep a bounded share alive through a launchd-managed native worker                                             |
 | `--json`                      | Print machine-readable background session details; requires `--background`                                   |
 | `--no-qr`                     | Do not print the terminal QR code                                                                             |
-| `--provider auto` (default)   | Detect and start every installed provider                                                                     |
+| `--provider auto` (default)   | Detect and start installed tunnel providers                                                                     |
 | `--provider tailscale-serve`  | Keep the link private to your tailnet                                                                         |
 | `--provider tailscale-funnel` | Create a public Tailscale link                                                                                |
-| `--https-port PORT`           | Require an exact Tailscale HTTPS port; when omitted, select an available port; `--funnel-port` is a compatibility alias |
+| `--provider local`            | Share directly on the LAN with your TLS certificate                                                           |
+| `--host HOST --cert PATH --key PATH` | Set the advertised hostname, PEM full chain, and PEM private key for Local HTTPS                         |
+| `--https-port PORT`           | Set the HTTPS port for Local or Tailscale. Local defaults to 8443. Tailscale selects an available port.        |
 
 Use either `--expire-after` or `--timeout`, not both. Run `remote-installer share --help` for every option.
 
-With the default `--provider auto`, Remote Installer checks for the Tailscale and cloudflared CLIs, starts every provider it can use, and prints a warning for each unavailable or unready provider. Tailscale Serve and Funnel use different HTTPS ports automatically so both can run in the same share. Tailscale configuration writes are serialized while Cloudflare starts independently. If you select one provider explicitly, only that provider is started. The terminal labels every result as `Public internet` or `Tailnet only` so the access boundary is visible next to the URL.
+With the default `--provider auto`, Remote Installer checks for the Tailscale and cloudflared CLIs, starts every provider it can use, and prints a warning for each unavailable or unready provider. Tailscale Serve and Funnel use different HTTPS ports automatically so both can run in the same share. Tailscale configuration writes are serialized while Cloudflare starts independently. If you select one provider explicitly, only that provider is started. The terminal shows each link’s access scope next to the URL.
 
 Remote Installer does not overwrite existing Tailscale Serve or Funnel routes. When `--https-port` is omitted, concurrent shares reserve different available ports on the node. An explicitly requested occupied port returns an error instead of replacing its route. Stopping a share closes only the foreground sessions owned by that process; it never runs a global `serve reset`.
 
@@ -182,7 +211,7 @@ Tailscale's tailnet-wide **MagicDNS** setting is different from each device's **
 - The build remains on your Mac rather than being uploaded for storage.
 - Cloudflare Quick Tunnel and Tailscale Funnel links are public. Tailscale Serve keeps access within your tailnet.
 - With Cloudflare, TLS terminates at Cloudflare while the build is transferred.
-- Stopping the command closes the tunnel and deletes Remote Installer's temporary copy.
+- Stopping the command closes the share and deletes Remote Installer's temporary copy.
 
 ## Troubleshooting
 
