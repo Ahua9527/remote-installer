@@ -626,10 +626,8 @@ impl ShareService {
     }
 
     /// Choose the public origin represented by an incoming Host header.
-    /// Unknown hosts fall back to the first configured origin; the origin
-    /// server is loopback-only, and a tunnel must already be configured for a
-    /// URL to reach it, so this is a URL-generation choice rather than an
-    /// access-control decision.
+    /// Unknown hosts fall back to the first configured origin. Generated URLs
+    /// always use a configured origin, regardless of the request's Host header.
     pub fn public_base_url_for_authority(&self, authority: Option<&str>) -> &Url {
         authority
             .and_then(|authority| {

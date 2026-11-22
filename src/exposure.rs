@@ -16,6 +16,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 use url::Url;
 
+mod local;
+pub use local::LocalExposure;
+
 const TAILSCALE_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const TAILSCALE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TAILSCALE_DNS_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,6 +63,7 @@ pub enum ExposureProvider {
     /// exposed a public Funnel URL.
     Tailscale,
     Cloudflare,
+    Local,
 }
 
 impl ExposureProvider {
@@ -68,6 +72,7 @@ impl ExposureProvider {
             Self::TailscaleServe => "Tailscale Serve",
             Self::TailscaleFunnel | Self::Tailscale => "Tailscale Funnel",
             Self::Cloudflare => "Cloudflare Quick Tunnel",
+            Self::Local => "Local HTTPS",
         }
     }
 
@@ -75,7 +80,7 @@ impl ExposureProvider {
         match self {
             Self::TailscaleServe => Some(TailscaleMode::Serve),
             Self::TailscaleFunnel | Self::Tailscale => Some(TailscaleMode::Funnel),
-            Self::Cloudflare => None,
+            Self::Cloudflare | Self::Local => None,
         }
     }
 }
@@ -104,6 +109,8 @@ impl TailscaleMode {
 
 #[derive(Debug, Error)]
 pub enum ExposureError {
+    #[error("Local HTTPS requires a host, certificate, and private key; use LocalExposure::bind")]
+    LocalConfigurationRequired,
     #[error("{display_name} CLI was not found.{install_hint}")]
     CliNotFound {
         display_name: &'static str,
@@ -290,6 +297,7 @@ impl ExposureSession {
                 .await
             }
             ExposureProvider::Cloudflare => start_cloudflare(target, cloudflared_binary).await,
+            ExposureProvider::Local => Err(ExposureError::LocalConfigurationRequired),
         }
     }
 
@@ -943,6 +951,7 @@ pub fn provider_binary_available(
             &[CLOUDFLARED_HOMEBREW_CLI, CLOUDFLARED_USR_LOCAL_CLI],
         )
         .is_some(),
+        ExposureProvider::Local => false,
     }
 }
 

@@ -17,9 +17,10 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::io::AsyncSeekExt;
+use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast};
+use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
 
 use crate::install_page;
@@ -374,12 +375,20 @@ fn request_authority<B>(request: &Request<B>) -> Option<&str> {
         })
 }
 
-/// Run the loopback origin used by one share session until the caller's
-/// shutdown future resolves. There is deliberately no public `serve` mode or
-/// TLS certificate configuration: the selected tunnel terminates HTTPS.
+/// Run the loopback origin used by a tunnel until shutdown.
 pub async fn run_listener(
     listener: TcpListener,
     state: HttpState,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), BoxError> {
+    run_listener_with_tls(listener, state, None, shutdown).await
+}
+
+/// Serve the same install resources directly over TLS when an acceptor is supplied.
+pub async fn run_listener_with_tls(
+    listener: TcpListener,
+    state: HttpState,
+    tls: Option<TlsAcceptor>,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), BoxError> {
     let listen = listener.local_addr()?;
@@ -393,6 +402,7 @@ pub async fn run_listener(
     let accept_connections = accept_loop(
         listener,
         state,
+        tls,
         connections.clone(),
         close_connections.clone(),
     );
@@ -437,6 +447,7 @@ async fn drain(connections: &Semaphore) {
 async fn accept_loop(
     listener: TcpListener,
     state: HttpState,
+    tls: Option<TlsAcceptor>,
     connections: Arc<Semaphore>,
     close_connections: broadcast::Sender<()>,
 ) -> Result<(), BoxError> {
@@ -468,44 +479,53 @@ async fn accept_loop(
         };
         let _ = stream.set_nodelay(true);
         let state = state.clone();
+        let tls = tls.clone();
         let mut closing = close_connections.subscribe();
         tokio::spawn(async move {
             let _permit = permit;
             let result = async {
-                // `http1_only` keeps the previous behaviour; the settings are
-                // applied through the parent builder rather than the `http1()`
-                // sub-builder because only the parent hands back a connection
-                // that can be told to shut down gracefully.
-                let mut connection_builder =
-                    ConnectionBuilder::new(TokioExecutor::new()).http1_only();
-                // hyper panics on every connection if a timeout is configured
-                // without a timer to drive it.
-                connection_builder
-                    .http1()
-                    .timer(TokioTimer::new())
-                    .header_read_timeout(HEADER_READ_TIMEOUT);
-                let service = service_fn(move |request| {
-                    let state = state.clone();
-                    async move { state.handle(request, peer).await }
-                });
-                let connection = connection_builder.serve_connection(TokioIo::new(stream), service);
-                tokio::pin!(connection);
-                loop {
-                    tokio::select! {
-                        result = connection.as_mut() => break result?,
-                        // An idle keep-alive connection ends here; one that is
-                        // mid-download keeps streaming until the body is done,
-                        // which is exactly what the drain is waiting for.
-                        _ = closing.recv() => connection.as_mut().graceful_shutdown(),
-                    }
+                if let Some(tls) = tls {
+                    let stream = tokio::select! {
+                        result = tokio::time::timeout(HEADER_READ_TIMEOUT, tls.accept(stream)) => result??,
+                        _ = closing.recv() => return Ok(()),
+                    };
+                    serve_connection(stream, peer, state, closing).await
+                } else {
+                    serve_connection(stream, peer, state, closing).await
                 }
-                Ok::<(), BoxError>(())
             }
             .await;
             if let Err(error) = result {
                 tracing::debug!(%error, %peer, "HTTP connection ended");
             }
         });
+    }
+}
+
+async fn serve_connection(
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    peer: SocketAddr,
+    state: HttpState,
+    mut closing: broadcast::Receiver<()>,
+) -> Result<(), BoxError> {
+    // Use the parent builder to obtain a connection that can drain gracefully.
+    let mut connection_builder = ConnectionBuilder::new(TokioExecutor::new()).http1_only();
+    connection_builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    let service = service_fn(move |request| {
+        let state = state.clone();
+        async move { state.handle(request, peer).await }
+    });
+    let connection = connection_builder.serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    loop {
+        tokio::select! {
+            result = connection.as_mut() => return result,
+            // End idle keep-alive connections and let active downloads finish.
+            _ = closing.recv() => connection.as_mut().graceful_shutdown(),
+        }
     }
 }
 

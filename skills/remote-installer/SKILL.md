@@ -2,9 +2,9 @@
 name: remote-installer
 description: >-
   Put an iOS or Android build on a real phone or tablet over the air with the
-  `remote-installer` CLI — it validates the build, opens a temporary HTTPS
-  tunnel, and prints one or more install URLs plus QR codes to scan. Use this
-  whenever
+  `remote-installer` CLI — it validates the build, shares it over HTTPS via a
+  tunnel or directly on the LAN, and prints install URLs plus QR codes to scan.
+  Use this whenever
   someone wants a build onto a physical device without TestFlight or a cable:
   "get this on my phone", "send this build to a tester", "share the IPA or APK",
   "install this on my iPad", "let QA try this build", "make a link for this
@@ -17,9 +17,9 @@ description: >-
 
 # Sharing a mobile build over the air
 
-`remote-installer share <build>` validates an iOS or Android build, stands up
-temporary HTTPS tunnels in front of a loopback server, and prints an install
-page URL plus a QR code for every provider that becomes ready. iOS uses
+`remote-installer share <build>` validates an iOS or Android build and prints an
+HTTPS install page URL for each ready provider. Foreground shares also print QR
+codes. The CLI supports temporary tunnels and direct LAN HTTPS. iOS uses
 `itms-services://`; Android downloads a signed standalone APK for the system
 installer. Stopping the process kills the links.
 
@@ -35,11 +35,11 @@ only the checks owned by those tools.
 stopped.** If the install link must remain alive after the current agent command
 or turn ends, use the CLI's `--background` mode with `--expire-after` or
 `--timeout`. It registers the native worker with launchd and returns only after
-the origin and tunnel are ready. Do not treat `&`, `nohup`, or a temporary tool
+the share is ready. Do not treat `&`, `nohup`, or a temporary tool
 session as durable background execution.
 
-Remote Installer owns the selected tunnel session and closes it when the
-foreground process or managed background worker stops.
+The foreground process or managed background worker owns the share and closes
+its listeners and any tunnels when it stops.
 
 The link is alive only while the process is. Don't stop it after reading the
 URL; it needs to stay up while the phone downloads. Use `--timeout` so it can
@@ -49,6 +49,9 @@ never outlive its usefulness on its own.
 
 Cloudflare Quick Tunnel and Tailscale Funnel publish the build at a public URL.
 Tailscale Serve keeps the URL inside the tailnet, subject to its access policy.
+Local HTTPS serves the build directly from the Mac to devices that can reach
+its listening address. For LAN-only requests, select `--provider local`
+explicitly and report missing prerequisites before opening a share.
 Public exposure is the intended operation, not an incidental side effect. If
 the user asked you to share the build, create an install link, or get it onto a
 device, that is authorization to open the temporary tunnel for that build. Do
@@ -63,7 +66,7 @@ The exposure boundary is deliberately narrow:
 - Only the explicitly selected, staged artifact and its install resources are
   routed; the source repository and surrounding filesystem are not served.
 - The intended inputs are already signed device builds. Device `.app`
-  signatures, architecture, and provisioning are verified before the tunnel
+  signatures, architecture, and provisioning are verified before the share
   starts; IPA archives are checked for signing evidence and a valid device
   profile. Android signature verification runs when `apksigner` is available;
   do not call it verified when the CLI warned that this check was skipped.
@@ -100,14 +103,15 @@ or run it for this invocation with `npx --yes @icodesign/remote-installer`. If n
 available, ask the user to install one of those packages rather than guessing
 a source checkout or binary path.
 
-**Check the tunnel CLIs.** The default `--provider auto` path detects both
-`cloudflared` (`brew install cloudflared`) and Tailscale (`brew install
+**Choose how the phone will reach the Mac.** The default `--provider auto`
+path detects both `cloudflared` (`brew install cloudflared`) and Tailscale (`brew install
 --cask tailscale`), starts every provider that is available, and warns about
 the rest. No Cloudflare account is needed for the Quick Tunnel. Select one
 provider explicitly only when the user requests it or an access requirement
 calls for one route. Otherwise keep the default auto mode. Auto mode may print
 several working links; they are alternate origins for one staged artifact, one
-download quota, and one lifecycle rather than separate copies.
+download quota, and one lifecycle rather than separate copies. Local HTTPS is
+selected explicitly and can run without either tunnel CLI.
 
 Remote Installer preserves existing Tailscale Serve and Funnel routes. When
 `--https-port` is omitted, concurrent shares reserve different available ports
@@ -140,8 +144,8 @@ JSON contains the share ID and a `links` array of ready provider results. Do not
 send any URL before the command reports a ready session, and do not collapse
 that array to its first entry.
 
-**Set `--timeout` on essentially every run.** It takes plain seconds and shuts
-the whole thing down when it elapses — tunnel closed, temporary copy deleted.
+**Set `--timeout` on essentially every run.** It takes plain seconds and closes
+the share and removes the temporary copy when it elapses.
 Without it the share lives until something stops it, and a background process
 you started is easy to walk away from: the user ends up with a public link to
 their build still open hours later. A generous bound is still a bound; when
@@ -173,10 +177,36 @@ Cloudflare also assigns a new hostname.
 `--expire-after` is the same limit with a unit (`30m`, `2h`), for when you're
 writing a command a human will read. Passing both is an error, so pick one.
 
+### Direct LAN HTTPS
+
+Use a CLI that lists `local` in `remote-installer share --help`. Select
+`--provider local` (alias `lan`). Confirm the phone can reach the sharing Mac
+over the LAN and that its DNS resolves the
+hostname to the Mac's LAN IP. The certificate must cover the exact hostname
+and be trusted by the phone. Use the full PEM certificate chain and its
+matching unencrypted PEM private key, readable by the account running the CLI.
+For issuance and DNS setup, see the [LAN recipe in the project README](https://github.com/icodesign/remote-installer#share-directly-on-your-lan).
+A Cloudflare DNS-only record or an internal DNS record can point the hostname
+at the private address. Use the hostname in the install URL when the
+certificate was issued for a DNS name.
+
+```bash
+remote-installer share /path/to/MyApp.ipa \
+  --provider local --host ota.example.com \
+  --cert /path/to/fullchain.pem --key /path/to/privkey.pem \
+  --expire-after 30m --max-downloads 3
+```
+
+Local HTTPS listens on `0.0.0.0:8443` by default. Use `--https-port PORT`
+for a different port, or `--listen 192.168.1.20:8443` to specify both the
+interface address and port. Add `--background --json` to the example for a
+managed share. Share the returned HTTPS install page URL, and keep access
+within the intended network using the bind address and firewall settings.
+
 Other flags worth knowing: `--provider tailscale-serve` (private to the
 tailnet), `--provider tailscale-funnel` (public through Tailscale), and
 `--provider tailscale` (the compatibility alias for Funnel), `--https-port`
-(require an exact Tailscale port instead of automatic allocation;
+(set the Local or Tailscale HTTPS port;
 `--funnel-port` is its visible compatibility alias), `--no-qr`,
 `--cloudflared-bin`, and `--tailscale-bin`.
 
@@ -201,15 +231,17 @@ Install link: itms-services://?action=download-manifest&url=...
 In auto mode, Tailscale Serve and Funnel blocks appear alongside the
 Cloudflare block when those CLIs and services are ready. A missing or failed
 provider is reported as a warning while the other links remain usable. Read the
-`Access:` line next to each block: it says `Public internet` or `Tailnet only`.
+`Access:` line next to each block for its reachability. Local HTTPS is labeled
+`Direct network access` and uses the configured hostname and port.
 
 For Android, `Requires` contains an API level and `Install link` is the granted
 HTTPS `download.apk` URL. Give the user the install page in either case.
 
 Return **every ready Install page URL** to the user, not just the first or a
 preferred provider. Label each URL with its provider and access scope (`Public
-internet` or `Tailnet only`) so the user can choose which route to open. A
-provider warning is not a reason to omit the other successful links. If only
+internet`, `Tailnet only`, or `Direct network access`) so the user can choose
+which route to open. A provider warning is not a reason to omit the other
+successful links. If only
 one provider becomes ready, return that one and briefly mention that it was the
 only available route.
 
@@ -253,15 +285,14 @@ remote-installer logs <share-id>
 Silence in the logs means the phone hasn't started downloading — usually that
 the page hasn't been opened yet, not that anything is broken.
 
-To stop, send Ctrl-C to the `share` process. It owns tunnel cleanup, so the
-selected Tailscale Serve/Funnel session or Cloudflare process closes with it.
-Stop a managed share with `remote-installer stop <share-id>` so launchd sends a
-graceful termination signal and closes the worker's tunnels.
+To stop, send Ctrl-C to the `share` process. Stop a managed share with
+`remote-installer stop <share-id>`. The process handles graceful shutdown of the
+listener and any tunnel it started.
 
 ## When validation fails
 
-Validation runs before the tunnel opens, so these fail locally in about a
-second with nothing exposed. Each is a real problem with the build:
+Build validation runs before the share opens. Use the reported error to pick a
+fix:
 
 | Error                                                | Means                          | Fix                                                                     |
 | ---------------------------------------------------- | ------------------------------ | ----------------------------------------------------------------------- |
@@ -271,6 +302,8 @@ second with nothing exposed. Each is a real problem with the build:
 | `embedded provisioning profile has expired`          | Stale profile                  | Refresh in Xcode and rebuild                                            |
 | `does not allow bundle identifier`                   | Profile is for a different app | Export with the matching profile                                        |
 | `macOS .app bundles cannot be installed on iOS`      | Wrong platform                 | Build for the iphoneos SDK                                              |
+| Local HTTPS certificate or key error                  | PEM file is unreadable, mismatched, or does not cover the host | Check `--host`, use the full chain and matching key, and check file permissions |
+| `could not bind Local HTTPS`                         | Address or port is unavailable | Use an available port or a local interface address                     |
 | `CLI was not found`                                  | Missing tunnel binary          | `brew install cloudflared`, or pass `--cloudflared-bin`                 |
 | Warning: `apkanalyzer was not found`                 | Metadata and split checks skipped | Install SDK Command-Line Tools or pass `--apkanalyzer-bin`           |
 | Warning: `apksigner was not found`                   | Signature verification skipped | Install SDK Build Tools or pass `--apksigner-bin`                      |
@@ -305,8 +338,8 @@ also requires the same signing certificate as the installed app.
 - The normal path validates an already signed build before exposure and serves
   only its temporary staged copy, not the repository. Signing does not make the
   build confidential or harmless if the URL leaks.
-- Cloudflare Quick Tunnel terminates TLS at Cloudflare while the build is
-  transferred. Tailscale Serve keeps the link private to the tailnet; Tailscale
-  Funnel provides a public link.
+- Cloudflare Quick Tunnel terminates TLS at Cloudflare. Tailscale Serve keeps
+  the link private to the tailnet, and Tailscale Funnel provides a public link.
+  Local HTTPS terminates TLS on the sharing Mac.
 - Cloudflare Quick Tunnel hostnames are random and new on every run, so a link
   can't be bookmarked or reused tomorrow.
